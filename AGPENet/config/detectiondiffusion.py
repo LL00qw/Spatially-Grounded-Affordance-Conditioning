@@ -34,6 +34,11 @@ model = dict(
     betas=[1e-4, 0.02],
     n_T=1000,
     drop_prob=0.1,
+    use_point_attention=True,
+    point_attn_dim=256,
+    conditioning_mode='adaptive_hierarchical',
+    eval_n_sample=200,
+    guide_w=0.2,
     weights_init='default_init',
 )
 
@@ -50,6 +55,7 @@ training_cfg = dict(
 
 data = dict(
     data_path="full_shape_release.pkl",
+    split_seed=1,
 )
 
 

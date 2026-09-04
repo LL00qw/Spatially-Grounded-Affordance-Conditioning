@@ -42,7 +42,15 @@ def build_model(cfg):
             betas = model_info.get('betas', [1e-4, 0.02])
             n_T = model_info.get('n_T', 1000)
             drop_prob = model_info.get('drop_prob', 0.1)
-            model = model_cls(betas, n_T, device, background_text, drop_prob)
+            use_point_attention = model_info.get('use_point_attention', True)
+            point_attn_dim = model_info.get('point_attn_dim', 256)
+            conditioning_mode = model_info.get('conditioning_mode', 'adaptive_hierarchical')
+            model = model_cls(
+                betas, n_T, device, background_text, drop_prob,
+                use_point_attention=use_point_attention,
+                point_attn_dim=point_attn_dim,
+                conditioning_mode=conditioning_mode,
+            )
         else:
             raise ValueError("The model name does not exist!")
         if weights_init != None:
@@ -60,9 +68,10 @@ def build_dataset(cfg):
     if hasattr(cfg, 'data'):
         data_info = cfg.data
         data_path = data_info.data_path
-        train_set = ThreeDAPDataset(data_path, mode='train')
-        val_set = ThreeDAPDataset(data_path, mode='val')
-        test_set = ThreeDAPDataset(data_path, mode='test')
+        split_seed = data_info.get('split_seed', cfg.get('seed', 1))
+        train_set = ThreeDAPDataset(data_path, mode='train', split_seed=split_seed)
+        val_set = ThreeDAPDataset(data_path, mode='val', split_seed=split_seed)
+        test_set = ThreeDAPDataset(data_path, mode='test', split_seed=split_seed)
         dataset_dict = dict(
             train_set=train_set,
             val_set=val_set,

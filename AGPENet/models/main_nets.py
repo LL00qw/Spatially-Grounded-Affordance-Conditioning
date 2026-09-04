@@ -1,56 +1,69 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from .components import TextEncoder, PointNetPlusPlus, PoseNet
+
+from .components import PointNetPlusPlus, PoseNet, TextEncoder
 
 
 text_encoder = TextEncoder(device=torch.device('cuda'))
 
 
-# Linear noise scheduler
 def linear_diffusion_schedule(betas, T):
-    """_summary_
-    Linear cheduling for sampling in training.
+    """Linear beta schedule indexed exactly by paper timesteps t=1,...,T.
+
+    Index 0 is an identity sentinel. This avoids the training/sampling
+    off-by-one mismatch in the stale code.
     """
-    beta_t = (betas[1] - betas[0]) * torch.arange(0, T + 1, dtype=torch.float32) / T + betas[0]
+    beta_t = torch.zeros(T + 1, dtype=torch.float32)
+    beta_t[1:] = torch.linspace(betas[0], betas[1], T, dtype=torch.float32)
+
+    alpha_t = 1.0 - beta_t
+    alphabar_t = torch.cumprod(alpha_t, dim=0)
+
     sqrt_beta_t = torch.sqrt(beta_t)
-    alpha_t = 1 - beta_t
-    log_alpha_t = torch.log(alpha_t)
-    alphabar_t = torch.cumsum(log_alpha_t, dim=0).exp()
-
     sqrtab = torch.sqrt(alphabar_t)
-    oneover_sqrta = 1 / torch.sqrt(alpha_t)
+    sqrtmab = torch.sqrt(torch.clamp(1.0 - alphabar_t, min=0.0))
+    oneover_sqrta = 1.0 / torch.sqrt(alpha_t)
 
-    sqrtmab = torch.sqrt(1 - alphabar_t)
-    mab_over_sqrtmab_inv = (1 - alpha_t) / sqrtmab
-    
+    mab_over_sqrtmab = torch.zeros_like(beta_t)
+    mab_over_sqrtmab[1:] = beta_t[1:] / torch.clamp(sqrtmab[1:], min=1e-12)
+
     return {
-        "alpha_t": alpha_t,  # \alpha_t
-        "oneover_sqrta": oneover_sqrta,  # 1/\sqrt{\alpha_t}
-        "sqrt_beta_t": sqrt_beta_t,  # \sqrt{\beta_t}
-        "alphabar_t": alphabar_t,  # \bar{\alpha_t}
-        "sqrtab": sqrtab,  # \sqrt{\bar{\alpha_t}}
-        "sqrtmab": sqrtmab,  # \sqrt{1-\bar{\alpha_t}}
-        "mab_over_sqrtmab": mab_over_sqrtmab_inv,  # (1-\alpha_t)/\sqrt{1-\bar{\alpha_t}}
+        "alpha_t": alpha_t,
+        "oneover_sqrta": oneover_sqrta,
+        "sqrt_beta_t": sqrt_beta_t,
+        "alphabar_t": alphabar_t,
+        "sqrtab": sqrtab,
+        "sqrtmab": sqrtmab,
+        "mab_over_sqrtmab": mab_over_sqrtmab,
     }
 
 
-# Main network for affordance detection and pose generation
 class DetectionDiffusion(nn.Module):
-    def __init__(self, betas, n_T, device, background_text, drop_prob=0.1):
-        """_summary_
+    """AGPENet: point-level re-grounding + conditional 6-DoF pose diffusion."""
 
-        Args:
-            drop_prob: probability to drop the conditions
-        """
-        super(DetectionDiffusion, self).__init__()
-        self.posenet = PoseNet()
-        self.pointnetplusplus = PointNetPlusPlus()
-        
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+    def __init__(
+        self,
+        betas,
+        n_T,
+        device,
+        background_text,
+        drop_prob=0.1,
+        use_point_attention=True,
+        point_attn_dim=256,
+        conditioning_mode="adaptive_hierarchical",
+    ):
+        super().__init__()
+        self.posenet = PoseNet(conditioning_mode=conditioning_mode)
+        self.pointnetplusplus = PointNetPlusPlus(
+            use_point_attention=use_point_attention,
+            point_attn_dim=point_attn_dim,
+        )
 
-        # Register_buffer allows accessing dictionary, e.g. can access self.sqrtab later
+        # Store log(gamma) so the learned inverse temperature is positive.
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1.0 / 0.07))
+
         for k, v in linear_diffusion_schedule(betas, n_T).items():
             self.register_buffer(k, v)
 
@@ -60,86 +73,125 @@ class DetectionDiffusion(nn.Module):
         self.drop_prob = drop_prob
         self.loss_mse = nn.MSELoss()
 
-    def forward(self, xyz, text, affordance_label, g):
-        """_summary_
-        This method is used in training, so samples _ts and noise randomly.
-        """
-        B = xyz.shape[0]    # xyz's size [B, 3, 2048]
+    @staticmethod
+    def _canonicalize_quaternion(q):
+        """Normalize q and choose a unique sign using scalar-last [x,y,z,w]."""
+        q = F.normalize(q, p=2, dim=-1, eps=1e-8)
+        sign = torch.where(q[..., 3:4] < 0, -torch.ones_like(q[..., 3:4]), torch.ones_like(q[..., 3:4]))
+        return q * sign
+
+    @staticmethod
+    def _project_quaternion_subvector(g):
+        """Project the quaternion subvector of a 7-D pose back to S^3."""
+        q = F.normalize(g[..., :4], p=2, dim=-1, eps=1e-8)
+        return torch.cat((q, g[..., 4:]), dim=-1)
+
+    @classmethod
+    def _canonicalize_clean_pose(cls, g):
+        return torch.cat((cls._canonicalize_quaternion(g[..., :4]), g[..., 4:]), dim=-1)
+
+    def _encode_text_pair(self, text, batch_size):
         with torch.no_grad():
-            foreground_text_features = text_encoder(text)   # size [B, 512]
-            background_text_features = text_encoder([self.background_text] * B)
+            foreground = text_encoder(text)
+            background = text_encoder([self.background_text] * batch_size)
+        return foreground, background
 
-        # 将文本特征传入PointNet++
-        point_features, c = self.pointnetplusplus(xyz, foreground_text_features)
+    def _affordance_logits(self, point_features, foreground_text_features, background_text_features):
+        text_features = torch.stack((background_text_features, foreground_text_features), dim=1)  # [B,2,512]
+        text_norm = F.normalize(text_features, p=2, dim=-1, eps=1e-8)
+        point_norm = F.normalize(point_features, p=2, dim=1, eps=1e-8)
+        gamma = self.logit_scale.exp().clamp(max=100.0)
+        return gamma * torch.einsum('bkc,bcn->bkn', text_norm, point_norm)
 
-        text_features = torch.cat((background_text_features.unsqueeze(1), \
-            foreground_text_features.unsqueeze(1)), dim=1)  # size [B, 2, 512]
-        
-        affordance_prediction = self.logit_scale * torch.einsum('bij,bjk->bik', text_features, point_features) \
-            / (torch.einsum('bij,bjk->bik', torch.norm(text_features, dim=2, keepdim=True), \
-                torch.norm(point_features, dim=1, keepdim=True)))   # size [B, 2, 2048]
-        
-        affordance_prediction = F.log_softmax(affordance_prediction, dim=1)
-        affordance_loss = F.nll_loss(affordance_prediction, affordance_label)
-        
-        _ts = torch.randint(1, self.n_T + 1, (B,)).to(self.device)
-        noise = torch.randn_like(g)  # eps ~ N(0, 1), g size [B, 7]
-        g_t = (
-            self.sqrtab[_ts - 1, None] * g
-            + self.sqrtmab[_ts - 1, None] * noise
-        )  # This is the g_t, which is sqrt(alphabar) g_0 + sqrt(1-alphabar) * eps
+    def forward(self, xyz, text, affordance_label, g):
+        """Training forward pass implementing Eqs. (15)-(21)."""
+        B = xyz.shape[0]
+        foreground_text_features, background_text_features = self._encode_text_pair(text, B)
 
-        # dropout context with some probability
-        context_mask = torch.bernoulli(torch.zeros(B, 1) + 1 - self.drop_prob).to(self.device)
-        
-        # Loss for poseing is MSE between added noise, and our predicted noise
-        pose_loss = self.loss_mse(noise, self.posenet(g_t, c, foreground_text_features, context_mask, _ts / self.n_T))
+        # PointNet++ returns re-grounded point descriptors and geometry-only c_X.
+        point_features, c_x = self.pointnetplusplus(xyz, foreground_text_features)
+
+        logits = self._affordance_logits(
+            point_features,
+            foreground_text_features,
+            background_text_features,
+        )
+        affordance_loss = F.cross_entropy(logits, affordance_label)
+
+        # Paper: canonicalize quaternion signs before corruption.
+        g0 = self._canonicalize_clean_pose(g)
+
+        # Uniform t in {1,...,T}, with the same schedule index used at sampling.
+        ts = torch.randint(1, self.n_T + 1, (B,), device=self.device)
+        noise = torch.randn_like(g0)
+        g_t = self.sqrtab[ts, None] * g0 + self.sqrtmab[ts, None] * noise
+
+        # Paper: Euclidean corruption followed by projection of q back to S^3.
+        g_t = self._project_quaternion_subvector(g_t)
+
+        # Joint condition dropout: the same mask drops both cloud and text.
+        context_mask = torch.bernoulli(
+            torch.full((B, 1), 1.0 - self.drop_prob, device=self.device)
+        )
+
+        pred_noise = self.posenet(
+            g_t,
+            c_x,
+            foreground_text_features,
+            context_mask,
+            ts.float() / self.n_T,
+        )
+        pose_loss = self.loss_mse(noise, pred_noise)
         return affordance_loss, pose_loss
 
     def detect_and_sample(self, xyz, text, n_sample, guide_w):
-        """_summary_
-        Detect affordance for one point cloud and sample [n_sample] poses that support the 'text' affordance task,
-        following the guidance sampling scheme described in 'Classifier-Free Diffusion Guidance'.
-        """
-        g_i = torch.randn(n_sample, (7)).to(self.device)  # start by sampling from Gaussian noise
-        foreground_text_features = text_encoder(text)  # size [1, 512]
-        background_text_features = text_encoder([self.background_text] * 1)
-        point_features, c = self.pointnetplusplus(xyz, foreground_text_features)  # point_features size [1, 512, 2048], c size [1, 1024]
+        """Predict point affordance labels and sample n_sample 6-DoF poses."""
+        g_i = torch.randn(n_sample, 7, device=self.device)
 
-        text_features = torch.cat((background_text_features.unsqueeze(1), \
-                                   foreground_text_features.unsqueeze(1)), dim=1)  # size [B, 2, 512]
+        foreground_text_features, background_text_features = self._encode_text_pair(text, 1)
+        point_features, c_x = self.pointnetplusplus(xyz, foreground_text_features)
 
-        affordance_prediction = self.logit_scale * torch.einsum('bij,bjk->bik', text_features, point_features) \
-                                / (torch.einsum('bij,bjk->bik', torch.norm(text_features, dim=2, keepdim=True), \
-                                                torch.norm(point_features, dim=1, keepdim=True)))  # size [1, 2, 2048]
+        logits = self._affordance_logits(
+            point_features,
+            foreground_text_features,
+            background_text_features,
+        )
+        affordance_prediction = torch.argmax(logits, dim=1)  # [1,N]
 
-        affordance_prediction = F.log_softmax(affordance_prediction, dim=1)  # .cpu().numpy()
-        c_i = c.repeat(n_sample, 1)
+        c_i = c_x.repeat(n_sample, 1)
         t_i = foreground_text_features.repeat(n_sample, 1)
-        context_mask = torch.ones((n_sample, 1)).float().to(self.device)
+        context_mask = torch.ones((n_sample, 1), dtype=torch.float32, device=self.device)
 
-        # Double the batch
+        # Batch conditional and unconditional evaluations for classifier-free guidance.
         c_i = c_i.repeat(2, 1)
         t_i = t_i.repeat(2, 1)
         context_mask = context_mask.repeat(2, 1)
-        context_mask[n_sample:] = 0.  # make second half of the back context-free
+        context_mask[n_sample:] = 0.0
 
         for i in range(self.n_T, 0, -1):
-            _t_is = torch.tensor([i / self.n_T]).repeat(n_sample).repeat(2).to(self.device)
-            g_i = g_i.repeat(2, 1)
+            time = torch.full(
+                (2 * n_sample,),
+                i / self.n_T,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            g_batch = g_i.repeat(2, 1)
 
-            z = torch.randn(n_sample, (7)) if i > 1 else torch.zeros((n_sample, 7))
-            z = z.to(self.device)
-            eps = self.posenet(g_i, c_i, t_i, context_mask, _t_is)
-            eps1 = eps[:n_sample]
-            eps2 = eps[n_sample:]
-            eps = (1 + guide_w) * eps1 - guide_w * eps2
+            eps_all = self.posenet(g_batch, c_i, t_i, context_mask, time)
+            eps_cond = eps_all[:n_sample]
+            eps_uncond = eps_all[n_sample:]
+            eps_hat = (1.0 + guide_w) * eps_cond - guide_w * eps_uncond
 
-            g_i = g_i[:n_sample]
-            g_i = self.oneover_sqrta[i] * (g_i - eps * self.mab_over_sqrtmab[i]) + self.sqrt_beta_t[i] * z
-        return np.argmax(affordance_prediction.cpu().numpy(), axis=1), g_i.cpu().numpy()
+            z = torch.randn(n_sample, 7, device=self.device) if i > 1 else torch.zeros(n_sample, 7, device=self.device)
+            g_i = (
+                self.oneover_sqrta[i]
+                * (g_i - eps_hat * self.mab_over_sqrtmab[i])
+                + self.sqrt_beta_t[i] * z
+            )
 
+            # Paper: renormalize the quaternion subvector after every reverse update.
+            g_i = self._project_quaternion_subvector(g_i)
 
-
-
-
+        # A unique output sign avoids q/-q ambiguity in downstream Euclidean checks.
+        g_i = self._canonicalize_clean_pose(g_i)
+        return affordance_prediction.cpu().numpy(), g_i.cpu().numpy()
